@@ -1,0 +1,370 @@
+---
+title: "Rna_seq"
+author: "saleh fayyaz"
+date: "January 30, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd('/media/saleh/New Volume/study/uni/7/computational Genomic/project')
+library(BiocStyle)
+# Setting single-core unless explicitly specified otherwise.
+
+library(Rtsne)
+library(destiny)
+
+library(R.utils)
+
+library(scater)
+
+library(scran)
+```
+
+fist we get the data as 
+```{r}
+tbl <- read.table('PBMC_scRNA-seq.txt')
+tbl <- as.matrix(tbl)
+tbl_2 <- tbl
+dim(tbl)
+```
+so we have 6713 gens for 3694 cell.
+then counts for spike-in transcripts and endogenous genes are stored in a SingleCellExperiment.
+```{r pressure, echo=FALSE,warning=FALSE}
+library(SingleCellExperiment)
+sce <- SingleCellExperiment(list(counts=tbl_2))
+dim(sce)
+```
+
+removing genes with existing in zero cell .
+
+```{r }
+keep <- rowSums(counts(sce) > 0) > 0
+sce <- sce[keep, ]
+```
+then we need to find spike-in transcript for using it for normalization part . 
+
+```{r spike-in }
+is.spike <- grepl("^ERC",rownames(sce))
+isSpike(sce,"ERC") <- is.spike
+summary(is.spike)
+```
+so we have 4 ERCC spike-in and 5 ERC . totally 9 spike-in was seen in dataset.
+
+for Quality Control part we need mitochonderial Gens .
+```{r echo=FALSE}
+is.mito <- grepl("^MT-", rownames(sce))
+isSpike(sce, "MT") <- is.mito
+summary(is.mito)
+```
+so we have 27 mitochonderial genes.
+```{r Quality control,warning=FALSE}
+sce <- calculateQCMetrics(
+    sce,
+    feature_controls = list(
+        ERCC = isSpike(sce, "ERC"),
+        Mt = isSpike(sce, "MT")
+  )
+)
+
+head(colnames(colData(sce)))
+
+```
+
+for Quality control we need creterion .
+#i find them in Biocunuctor site like this :
+
+Low-quality cells need to be removed to ensure that technical effects do not distort downstream analysis results. We use several quality control (QC) metrics:
+
+1- The library size is defined as the total sum of counts across all features, i.e., genes and spike-in transcripts. Cells with small library sizes are of low quality as the RNA has not been efficiently captured (i.e., converted into cDNA and amplified) during library preparation.
+2- The number of expressed features in each cell is defined as the number of features with non-zero counts for that cell. Any cell with very few expressed genes is likely to be of poor quality as the diverse transcript population has not been successfully captured.
+3- The proportion of reads mapped to spike-in transcripts is calculated relative to the library size for each cell. High proportions are indicative of poor-quality cells, where endogenous RNA has been lost during processing (e.g., due to cell lysis or RNA degradation). The same amount of spike-in RNA to each cell, so an enrichment in spike-in counts is symptomatic of loss of endogenous RNA.
+4- In the absence of spike-in transcripts, the proportion of reads mapped to genes in the mitochondrial genome can also be used. High proportions are indicative of poor-quality cells (Islam et al. 2014; Ilicic et al. 2016), possibly because of loss of cytoplasmic RNA from perforated cells. The reasoning is that mitochondria are larger than individual transcript molecules and less likely to escape through tears in the cell membrane.
+
+so for defining bad cell and remove it we first plot histogram for each part :
+
+```{r ploting_histogram of}
+par(mfrow=c(2,2), mar=c(5.1, 4.1, 0.1, 0.1))
+hist(sce$total_counts/1e6, xlab="Library sizes (millions)", main="", 
+    breaks=20, col="grey80", ylab="Number of cells")
+hist(sce$total_features, xlab="Number of expressed genes", main="", 
+    breaks=20, col="grey80", ylab="Number of cells")
+hist(sce$pct_counts_ERCC, xlab="ERCC proportion (%)", 
+    ylab="Number of cells", breaks=20, main="", col="grey80")
+
+
+hist(sce$pct_counts_Mt, xlab="Mitochondrial proportion (%)", 
+    ylab="Number of cells", breaks=20, main="", col="grey80")
+
+```
+then based on 3 * MAD of data in each part I will remove bad cells .
+1- I remove cells with log-library sizes that are more than 3 MADs below the median log-library size. 
+A log-transformation improves resolution at small values, especially when the MAD of the raw values is comparable to or greater than the median. 
+2- I also remove cells where the log-transformed number of expressed genes is 3 MADs below the median value.(#BioConductor)
+then i will remove proportion of spike-in and mithochonderial criterion without log tranfrom and by type higher as we are identifying large outliers, for which the distinction should be fairly clear on the raw scale .
+```{r}
+library(mvoutlier)
+libsize.drop <- isOutlier(sce$total_counts, nmads=3, type="lower", log=TRUE)
+feature.drop <- isOutlier(sce$total_features, nmads=3, type="lower", log=TRUE)
+
+spike.drop <- isOutlier(sce$pct_counts_ERCC, nmads=3, type="higher")
+mito.drop <- isOutlier(sce$pct_counts_Mt  , nmads=3, type="higher")
+
+```
+
+now i remove bad cells based on criterions .
+and then i will how many
+```{r}
+sce <- sce[,!(libsize.drop | feature.drop | spike.drop | mito.drop )]
+data.frame(ByLibSize=sum(libsize.drop), ByFeature=sum(feature.drop),
+    BySpike=sum(spike.drop),ByMito=sum(mito.drop), Remaining=ncol(sce))
+```
+
+## gene filtering 
+
+first i will use average count for each gene beacause as we know some cells may have low gene expression for some gene by default . then i will use second approach for rare populations .  
+I calculate this using the calcAverage function, which also performs some adjustment for library size differences between cells We typically observe a peak of moderately expressed genes following a plateau of lowly expressed genes .
+
+```{r}
+ave.counts <- calcAverage(sce)
+hist(log10(ave.counts), breaks=100, main="", col="grey80", 
+    xlab=expression(Log[10]~"average count"))
+```
+
+then i will remove genes by avg_count less than 1 .
+```{r}
+keep_genes <- ave.counts >= 1
+filtered.sce <- sce[keep_genes,]
+summary(keep_genes)
+```
+
+i use second appraoch for rare populations .
+i will use 'nxprs'from scater library that is counting the number of expressed genes per cell.
+
+```{r}
+cell_exp_count <- nexprs(sce, byrow=TRUE)
+### i will use zero threshold for removing gens that are not expressed in any cell .
+to.keep <- cell_exp_count > 0
+sce <- sce[to.keep,]
+summary(to.keep)
+
+```
+
+
+##Normalization
+1- #deconvlotion
+Cell-specific biases are normalized using the computeSumFactors method, which implements the deconvolution strategy for scRNA-seq normalization. This computes size factors that are used to scale the counts in each cell.
+
+as said there is an assumption that for most genes are not diffrentialy expressed between cells . so what we can do for difrentially expressed genes that we use them later for clustring ?
+in R For larger data sets, clustering should be performed with the quickCluster function before normalization. Briefly, cells are grouped into clusters of similar expression; normalization is applied within each cluster to compute size factors for each cell; and the factors are rescaled by normalization between clusters. This reduces the risk of violating the above assumption when many genes are DE between clusters in a heterogeneous population.
+
+
+
+```{r}
+sce2 <- computeSumFactors(sce)
+summary(sizeFactors(sce2))
+plot(sizeFactors(sce2), sce2$total_counts/1e6, log="xy",
+    ylab="Library size (millions)", xlab="Size factor")
+```
+
+if our hypothesis about a lot of none-DE genes was good we have to see a high correlation between libery size and size factor (linear) . as any DE between cells would yield a non-linear trend between the total count and size factor, and/or increased scatter around the trend.
+as you see in plot this is not very good assumption . so we use quickcluster .
+before that i will use data in spike-in RNA . as we know the same amount of spike-in was added to each cell prior to library prepration . 
+(biocundoctor)it is strongly recommended to compute a separate set of size factors for the spike-ins. This is because the spike-ins are not affected by total mRNA content. Using the deconvolution size factors will over-normalize the spike-in counts, whereas the spike-in size factors are more appropriate.
+for not overwriting the former i will set not genral use in below function .
+This means that the spike-in-based size factors will be computed and stored in the SingleCellExperiment object, but will only be used by the spike-in transcripts.
+
+```{r}
+clusters <- quickCluster(sce, method = "igraph")
+sce <- computeSumFactors(sce, cluster=clusters)
+sce <- computeSpikeFactors(sce, general.use=FALSE)
+#Applying the size factors to normalize gene expression
+sce <- normalize(sce)
+```
+#another approach for normalization can be :
+```{r}
+library(DESeq2)
+library(GenomicRanges)
+se <- SummarizedExperiment(ceiling(counts(sce)))
+colData(se) <- DataFrame(colData(sce))
+dds <- DESeqDataSet( se, design = ~ 1 )
+
+#Estimate size factors
+dds <- estimateSizeFactors( dds )
+
+#Plot column sums according to size factor
+plot(sizeFactors(dds), colSums(counts(dds)))
+
+#The argument normalized equals true, divides each column by its size factor.
+logcounts <- log2( counts(dds, normalized=TRUE) + 1 )
+
+```
+##why I used decovloution method for this data ?
+Briefly this method deals with the problem of vary large numbers of zero values per cell by pooling cells together calculating a normalization factor (similar to CPM) for the sum of each pool. Since each cell is found in many different pools, cell-specific factors can be deconvoluted from the collection of pool-specific factors using linear algebra.
+as you can see in the data we have a lorge number of zeros in dataset so this method is realiable for this data .
+#
+
+```{r}
+# create a list to simplify the plotting step
+
+
+# visualise the data as a set of boxplots
+#pdf(file="./normalising_ex2.pdf", width=10)
+#boxplot(counts(sce))
+#dev.off()
+```
+
+# clustring 
+#PCA for Dimention Reduction
+for better visulaising i use quick clustring in the latter part to color each cell . 
+for size too i will use "pct_counts_endogenous" as argument.
+```{r}
+sce$clusters = clusters
+plotPCA(sce, colour_by = 'clusters', size_by = "pct_counts_endogenous")
+```
+as you can see a good clustring is happening in PCA aproach . 
+#t-SNE
+```{r}
+plotTSNE(sce, colour_by = 'clusters', size_by = "pct_counts_endogenous")
+```
+its hard ro justify which one one is better on accuracy but intrestingly PCA get much less time than T-SNE that makes it more intresting . 
+##Validation Measures(clValid package)
+1 - #Internal validation:
+measures take only the dataset and the clustering partition as input and use intrinsic information in the data to assess the quality of the clustering. 
+2 - #The stability measures :
+are a special version of internal measures. They evaluate the consistency of a
+clustering result by comparing it with the clusters obtained after each column
+is removed, one at a time 
+3- # Biological validation :
+evaluates the ability of a clustering algorithm to produce biologically meaningful clusters
+
+1-A) we selected measures that reflect the #compactness,
+connectedness, and #separation of the cluster partitions. Connectedness relates
+to what extent observations are placed in the same cluster as their
+nearest neighbors in the data space, and is here measured by the connectivity . Compactness assesses cluster homogeneity, usually
+by looking at the intra-cluster variance, while separation quantifies the
+degree of separation between clusters (usually by measuring the distance
+between cluster centroids)
+
+The Dunn Index (Dunn, 1974) and Silhouette Width (Rousseeuw,
+1987) are both examples of non-linear combinations of the compactness and
+separation.
+
+#Silhouette Width
+The Silhouette Width is the average of each observation’s Silhouette value.
+The Silhouette value measures the degree of confidence in the clustering assignment
+of a particular observation, with well-clustered observations having
+values near 1 and poorly clustered observations having values near −1. For
+observation i, it is defined as:
+![sill](/home/saleh/Pictures/sill.png)
+where C(i) is the cluster containing observation i, dist(i, j) is the distance
+(e.g. Euclidean, Manhattan) between observations i and j, and n(C) is the
+cardinality of cluster C. The Silhouette Width thus lies in the interval
+[−1, 1], and should be maximized. For more information, see the help page
+for the silhouette() function in package cluster (Rousseeuw et al., 2006).
+
+#Dunn Index
+The Dunn Index is the ratio of the smallest distance between observations
+not in the same cluster to the largest intra-cluster distance. It is computed
+![don](/home/saleh/Pictures/don.png)
+
+where diam(Cm) is the maximum distance between observations in cluster
+Cm. The Dunn Index has a value between zero and ∞, and should be
+maximized.
+
+
+#Stability measures
+The stability measures compare the results from clustering based on the full
+data to clustering based on removing each column, one at a time. These
+measures work especially well if the data are highly correlated, which is
+often the case in high-throughput genomic data. The included measures are
+the average proportion of non-overlap (APN), the average distance (AD),
+the average distance between means (ADM), and the figure of merit (FOM)
+(Datta and Datta, 2003; Yeung et al., 2001). In all cases the average is taken
+over all the deleted columns, and all measures should be minimized.
+
+#Biological
+1- Biological Homogeneity Index (BHI)
+![don](/home/saleh/Pictures/bhi0.png)
+![don](/home/saleh/Pictures/bhi.png)
+
+![bsi](/home/saleh/Pictures/bsi.png)
+ 
+## Clustring methods :
+in here i will find best k by internal measure in "clValid" package that discussed before.
+before that i will find PCA for dimention reduction and work better for clustring algorithms.
+
+```{r}
+sce.pca <- prcomp(t(counts(sce)))
+sce.pca$sdev[1:100]
+### if you see sce.pca$sdev you will find out a lot of varience in whole data is in first 5 Principle component.
+n_pc<-5
+ex_pc <- sce.pca$x[,1:n_pc]
+```
+
+#Best K:
+then for finding best k for clustring i will use 'clvalid' package that by using cluster validation measure in top defines which k is better . 
+in here i will give clvalid 3 diffrent approach in clustering and for internal criterion to find best k . 
+```{r}
+library(clValid)
+intern <- clValid(ex_pc, 5:10, clMethods=c("hierarchical","kmeans","pam"), validation="internal",maxitems=7000)
+summary(intern)
+## as you can see results for k=5 and k==8 are optimal 
+# here i will ploting them too .
+op <- par(no.readonly=TRUE)
+par(mfrow=c(2,2),mar=c(4,4,3,1))
+plot(intern, legend=FALSE)
+plot(nClusters(intern),measures(intern,"Dunn")[,,1],type="n",axes=F, xlab="",ylab="")
+legend("center", clusterMethods(intern), col=1:9, lty=1:9, pch=paste(1:9))
+par(op)
+```
+#Clustring 
+at last i will plot each clustring then i will use kmeans as my clustring algorithm . 
+you can findout here that i had used 5 PC for clustring but for visulization only 2 of them is need.
+
+```{r}
+ex_2pc <- as.data.frame(sce.pca$x[,1:2])
+ex_2pc$class5 <-  (kmeans(ex_pc[,1:2] , centers= 5, iter.max = 10000 , nstart =  100))$cluster
+ex_2pc$class6 <-  (kmeans(ex_pc[,1:2] , centers= 6, iter.max = 10000 , nstart =  100))$cluster
+
+ex_2pc$class7 <-  (kmeans(ex_pc[,1:2] , centers= 7, iter.max = 10000 , nstart =  100))$cluster
+
+ex_2pc$class8 <-  (kmeans(ex_pc[,1:2] , centers= 8, iter.max = 10000 , nstart =  100))$cluster
+
+ex_2pc$class9 <-  (kmeans(ex_pc[,1:2] , centers= 9, iter.max = 10000 , nstart =  100))$cluster
+
+ex_2pc$class10 <-  (kmeans(ex_pc[,1:2] , centers= 10,iter.max = 10000 , nstart =  100))$cluster
+
+```
+#Plot :
+```{r,warning=FALSE}
+library(ggplot2)
+library(gridExtra)
+### for visualization part i will choose only 2 PC 
+par(mfrow=c(2,3))
+
+plot_r_1 <- ggplot(ex_2pc, aes(ex_2pc$PC1, ex_2pc$PC2 , color = class5)) + geom_point() +  xlab("PC1") + ylab("PC2")
+
+plot_r_2 <- ggplot(ex_2pc, aes(ex_2pc$PC1, ex_2pc$PC2 , color = class6)) + geom_point() +  xlab("PC1") + ylab("PC2")
+
+plot_r_3 <- ggplot(ex_2pc, aes(ex_2pc$PC1, ex_2pc$PC2 , color = class7)) + geom_point() +  xlab("PC1") + ylab("PC2")
+
+plot_r_4 <- ggplot(ex_2pc, aes(ex_2pc$PC1, ex_2pc$PC2 , color = class8)) + geom_point() +  xlab("PC1") + ylab("PC2")
+
+plot_r_5 <- ggplot(ex_2pc, aes(ex_2pc$PC1, ex_2pc$PC2 , color = class9)) + geom_point() +  xlab("PC1") + ylab("PC2")
+
+plot_r_6 <- ggplot(ex_2pc, aes(ex_2pc$PC1, ex_2pc$PC2 , color = class10)) + geom_point() +  xlab("PC1") + ylab("PC2")
+
+grid.arrange( plot_r_1, plot_r_2,plot_r_3 , plot_r_4 , plot_r_5 , plot_r_6 , ncol = 3)
+
+```
+
+as you can see none of clusters remains fixed completly . but you can say that almost in every picture you can find 6 cluster in class8 plot that remains constant in class 9 and 10 too .
+
+# Naming clusters based on cells on clusters 
+for naming each cluster we need to find important genes in each cluster that by them we can name the cluster . we name these genes markers . 
+but how to define importance of genes . i say a gene is diffrentially expresed in each cluster . for finding these we need to have some hypothesis testing prosecure . 
+Find candidate marker genes for clusters of cells, by testing for differential expression between clusters.
+as i searched The first step in our marker gene identification process is to identify previously reported cell type markers . 
+ Fortunately, the literature is rich in papers measuring gene expression in isolated immune cell populations.
+
